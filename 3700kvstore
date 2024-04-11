@@ -50,10 +50,11 @@ class Replica:
                 self.redirect(message)
                 return
             elif self.state == "leader":
-                message["src"] = self.id
+                replica_msg = {"src": self.id, "dst": BROADCAST, "leader": self.leader, "type": "put", 
+                "MID": message["MID"], "key": message["key"], "value": message["value"]}
                 for id in self.others:
-                    message["dst"] = id
-                    self.send(message)
+                    replica_msg["dst"] = id
+                    self.send(replica_msg)
                 self.last_leader_msg = time.time()
             
             key = message["key"]
@@ -68,16 +69,17 @@ class Replica:
             fail = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "fail", "MID": message["MID"]}
             self.send(fail)
 
-    def handle_get(self, mesage):
+    def handle_get(self, message):
         try:
             if self.state != "leader" and message["src"] != self.leader:
                 self.redirect(message)
                 return
             elif self.state == "leader":
-                message["src"] = self.id
+                replica_msg = {"src": self.id, "dst": BROADCAST, "leader": self.leader, "type": "get", 
+                "MID": message["MID"], "key": message["key"]}
                 for id in self.others:
-                    message["dst"] = id
-                    self.send(message)
+                    replica_msg["dst"] = id
+                    self.send(replica_msg)
                 self.last_leader_msg = time.time()
 
             key = message["key"]
@@ -118,7 +120,6 @@ class Replica:
 
     def run(self):
         while True:
-            #print("!!!! LEADER: " + self.leader)
             if self.state == 'leader':
                 self.leader_behavior()
             if self.state == 'follower':
@@ -126,9 +127,7 @@ class Replica:
 
             data, addr = self.socket.recvfrom(65535)
             msg = json.loads(data.decode('utf-8'))
-            # meh
             print("Received message '%s'" % (msg,), flush=True)
-            #message = json.loads(msg)
 
             if self.state != "leader" and msg["src"] == self.leader:
                 self.last_leader_msg = time.time()
