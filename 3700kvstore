@@ -48,13 +48,20 @@ class Replica:
         try:
             if self.state != "leader" and message["src"] != self.leader:
                 self.redirect(message)
+                return
+            elif self.state == "leader":
+                message["src"] = self.id
+                for id in self.others:
+                    message["dst"] = id
+                    self.send(message)
+                self.last_leader_msg = time.time()
+            
             key = message["key"]
             value = message["value"]
             self.database[key] = value
-            #ok = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "ok", "MID": message["MID"]}
-            #self.send(ok)
-            fail = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "fail", "MID": message["MID"]}
-            self.send(fail)
+            #if self.state != "leader":
+            ok = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "ok", "MID": message["MID"]}
+            self.send(ok)
         except Exception as e:
             print("incorrect format of put message")
             print(e)
@@ -65,15 +72,21 @@ class Replica:
         try:
             if self.state != "leader" and message["src"] != self.leader:
                 self.redirect(message)
+                return
+            elif self.state == "leader":
+                message["src"] = self.id
+                for id in self.others:
+                    message["dst"] = id
+                    self.send(message)
+                self.last_leader_msg = time.time()
+
             key = message["key"]
             value = self.database.get(key)
             if value is None:
                 value = ""
-            #ok = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "ok", "MID": message["MID"], 
-            #"value": value}
-            #self.send(ok)
-            fail = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "fail", "MID": message["MID"]}
-            self.send(fail)
+            #if self.state != "leader":
+            ok = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "ok", "MID": message["MID"], "value": value}
+            self.send(ok)
         except Exception as e:
             print("incorrect format of get message")
             print(e)
@@ -98,8 +111,10 @@ class Replica:
 
     def leader_behavior(self):
         if self.timeout_expired():
-            # send empty append entries message
-            return
+            append_entries = {"src": self.id, "dst": BROADCAST, "leader": self.id, "type": "AppendEntries", 
+            "MID": self.generate_mid(), "term": self.current_term, "prevLogIndex": self.prev_log_index, 
+            "prevLogTerm": self.prev_log_term, "entries": [], "leaderCommit": self.leader_commit_index}
+            self.send(append_entries)
 
     def run(self):
         while True:
@@ -115,14 +130,15 @@ class Replica:
             print("Received message '%s'" % (msg,), flush=True)
             #message = json.loads(msg)
 
+            if self.state != "leader" and msg["src"] == self.leader:
+                self.last_leader_msg = time.time()
+
             msg_type = msg["type"]
             if msg_type == "put":
-                print("in put")
-                #self.handle_put(message)
+                self.handle_put(msg)
                 pass
             elif msg_type == "get":
-                print("in get")
-                #self.handle_get(message)
+                self.handle_get(msg)
                 pass
             elif msg_type == "RequestVote":
                 if self.state != "leader" and not self.voted:
@@ -137,10 +153,9 @@ class Replica:
                         print("---- %s IS THE NEW LEADER" % (self.id))
                         self.state = "leader"
                         # broadcast AppendEntries message
-                        empty_entries = []
                         append_entries = {"src": self.id, "dst": BROADCAST, "leader": self.id, "type": "AppendEntries", 
                         "MID": self.generate_mid(), "term": self.current_term, "prevLogIndex": self.prev_log_index, 
-                        "prevLogTerm": self.prev_log_term, "entries": empty_entries, "leaderCommit": self.leader_commit_index}
+                        "prevLogTerm": self.prev_log_term, "entries": [], "leaderCommit": self.leader_commit_index}
                         self.send(append_entries)
                         self.leader = self.id
                         self.voted = False
