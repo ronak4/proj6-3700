@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import argparse, socket, time, json, select, struct, sys, math, os
+import argparse, socket, time, json, select, struct, sys, math, os, random, string
 
 BROADCAST = "FFFF"
 
@@ -13,6 +13,16 @@ class Replica:
         self.database = {}
         self.leader = "FFFF"
         self.state = "follower"
+        self.current_term = 0
+        self.voted = False
+        self.votes_received = 0
+        self.timeout = random.uniform(0.015, 0.03)
+        self.last_leader_msg = time.time()
+        self.prev_log_index = 0
+        self.prev_log_term = 0
+        self.entries = []
+        self.leader_commit_index = 0
+
 
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind(('localhost', 0))
@@ -24,6 +34,11 @@ class Replica:
 
     def send(self, message):
         self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
+    
+    def generate_mid(self):
+        characters = string.ascii_uppercase + string.digits  
+        random_string = ''.join(random.choice(characters) for _ in range(16))
+        return random_string
 
     def redirect(self, message):
         redirect = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "redirect", "MID": message["MID"]}
@@ -64,21 +79,85 @@ class Replica:
             print(e)
             fail = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "fail", "MID": message["MID"]}
             self.send(fail)
+    
+    def timeout_expired(self):
+        return time.time() - self.last_leader_msg > self.timeout
+
+    def follower_behavior(self):
+        # follower behavior
+        print("---- in follower behavior")
+        if self.timeout_expired():
+            print("---- %s beginning election" % (self.id))
+            self.state = 'candidate'
+            self.current_term += 1
+            self.votes_received = 1
+            # send request_vote messages to everyone
+            request_vote = {"src": self.id, "dst": BROADCAST, "leader": self.id, "type": "RequestVote", "MID": self.generate_mid()}
+            self.send(request_vote)
+            self.voted = True
+
+    def leader_behavior(self):
+        if self.timeout_expired():
+            # send empty append entries message
+            return
 
     def run(self):
         while True:
+            #print("!!!! LEADER: " + self.leader)
+            if self.state == 'leader':
+                self.leader_behavior()
+            if self.state == 'follower':
+                self.follower_behavior()
+
             data, addr = self.socket.recvfrom(65535)
-            msg = data.decode('utf-8')
+            msg = json.loads(data.decode('utf-8'))
             # meh
             print("Received message '%s'" % (msg,), flush=True)
-            message = json.loads(msg)
-            print(message)
+            #message = json.loads(msg)
 
-            msg_type = message["type"]
+            msg_type = msg["type"]
             if msg_type == "put":
-                self.handle_put(message)
+                print("in put")
+                #self.handle_put(message)
+                pass
             elif msg_type == "get":
-                self.handle_get(message)
+                print("in get")
+                #self.handle_get(message)
+                pass
+            elif msg_type == "RequestVote":
+                if self.state != "leader" and not self.voted:
+                    print("---- %s votes for %s as leader" % (self.id, msg["leader"]))
+                    vote = {"src": self.id, "dst": msg["src"], "leader": msg["leader"], "type": "Vote", "MID": msg["MID"]}
+                    self.send(vote)
+                    self.voted = True
+            elif msg_type == "Vote":
+                if self.state == "candidate":
+                    self.votes_received += 1
+                    if (len(self.others) + 1) / 2 < self.votes_received:
+                        print("---- %s IS THE NEW LEADER" % (self.id))
+                        self.state = "leader"
+                        # broadcast AppendEntries message
+                        empty_entries = []
+                        append_entries = {"src": self.id, "dst": BROADCAST, "leader": self.id, "type": "AppendEntries", 
+                        "MID": self.generate_mid(), "term": self.current_term, "prevLogIndex": self.prev_log_index, 
+                        "prevLogTerm": self.prev_log_term, "entries": empty_entries, "leaderCommit": self.leader_commit_index}
+                        self.send(append_entries)
+                        self.leader = self.id
+                        self.voted = False
+                        self.votes_received = 0
+                        self.last_leader_msg = time.time()
+                        self.timeout = 0.01
+            elif msg_type == "AppendEntries":
+                self.last_leader_msg = time.time()
+                if self.leader != msg["leader"] and self.current_term <= msg["term"]:
+                    print("---- %s notified that %s is the new leader" % (self.id, msg["leader"]))
+                    self.state = "follower"
+                    self.leader = msg["leader"]
+                    self.current_term = msg["term"]
+                    self.voted = False
+                    self.votes_received = 0
+                    self.timeout = random.uniform(0.015, 0.03)
+
 
 
 if __name__ == "__main__":
