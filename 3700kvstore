@@ -60,9 +60,9 @@ class Replica:
             key = message["key"]
             value = message["value"]
             self.database[key] = value
-            #if self.state != "leader":
-            ok = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "ok", "MID": message["MID"]}
-            self.send(ok)
+            if self.state == "leader":
+                ok = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "ok", "MID": message["MID"]}
+                self.send(ok)
         except Exception as e:
             print("incorrect format of put message")
             print(e)
@@ -86,9 +86,9 @@ class Replica:
             value = self.database.get(key)
             if value is None:
                 value = ""
-            #if self.state != "leader":
-            ok = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "ok", "MID": message["MID"], "value": value}
-            self.send(ok)
+            if self.state == "leader":
+                ok = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "ok", "MID": message["MID"], "value": value}
+                self.send(ok)
         except Exception as e:
             print("incorrect format of get message")
             print(e)
@@ -117,12 +117,15 @@ class Replica:
             "MID": self.generate_mid(), "term": self.current_term, "prevLogIndex": self.prev_log_index, 
             "prevLogTerm": self.prev_log_term, "entries": [], "leaderCommit": self.leader_commit_index}
             self.send(append_entries)
+            self.last_leader_msg = time.time()
 
     def run(self):
         while True:
+            #print("uhhhhhhhhhhhhhhhhhhh")
+            #print(self.state + " with num votes: " + str(self.votes_received))
             if self.state == 'leader':
                 self.leader_behavior()
-            if self.state == 'follower':
+            if self.state != 'leader' and not self.voted:
                 self.follower_behavior()
 
             data, addr = self.socket.recvfrom(65535)
@@ -135,10 +138,8 @@ class Replica:
             msg_type = msg["type"]
             if msg_type == "put":
                 self.handle_put(msg)
-                pass
             elif msg_type == "get":
                 self.handle_get(msg)
-                pass
             elif msg_type == "RequestVote":
                 if self.state != "leader" and not self.voted:
                     print("---- %s votes for %s as leader" % (self.id, msg["leader"]))
@@ -163,12 +164,12 @@ class Replica:
                         self.timeout = 0.01
             elif msg_type == "AppendEntries":
                 self.last_leader_msg = time.time()
+                self.voted = False
                 if self.leader != msg["leader"] and self.current_term <= msg["term"]:
                     print("---- %s notified that %s is the new leader" % (self.id, msg["leader"]))
                     self.state = "follower"
                     self.leader = msg["leader"]
                     self.current_term = msg["term"]
-                    self.voted = False
                     self.votes_received = 0
                     self.timeout = random.uniform(0.015, 0.03)
 
