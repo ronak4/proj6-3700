@@ -18,10 +18,10 @@ class Replica:
         self.votes_received = 0
         self.timeout = random.uniform(0.015, 0.03)
         self.last_leader_msg = time.time()
-        self.prev_log_index = 0
-        self.prev_log_term = 0
+        self.prev_log_index = -1
+        self.prev_log_term = -1
         self.entries = []
-        self.commit_index = 0
+        self.commit_index = -1
         self.ok_received = 0
 
 
@@ -51,25 +51,29 @@ class Replica:
                 self.redirect(message)
                 return
             elif self.state == "leader":
+                '''
                 replica_msg = {"src": self.id, "dst": BROADCAST, "leader": self.leader, "type": "put", 
                 "MID": message["MID"], "key": message["key"], "value": message["value"]}
                 for id in self.others:
                     replica_msg["dst"] = id
                     self.send(replica_msg)
-                self.last_leader_msg = time.time()
-            
-            key = message["key"]
-            value = message["value"]
-            self.database[key] = value
-            
-            if self.state == "leader":
+                '''
+                key = message["key"]
+                value = message["value"]
+                #self.database[key] = value
+
                 entry = [self.current_term, key, value]
                 self.entries.append(entry)
                 append_entries = {"src": self.id, "dst": BROADCAST, "leader": self.id, "type": "AppendEntries", 
                 "MID": self.generate_mid(), "term": self.current_term, "prevLogIndex": self.prev_log_index, 
                 "prevLogTerm": self.prev_log_term, "entries": self.entries, "leaderCommit": self.commit_index}
                 self.send(append_entries)
+                self.last_leader_msg = time.time()
                 self.ok_received = 1
+                self.prev_log_index = len(self.entries) - 1
+                self.prev_log_term = self.current_term
+                
+            
 
             ok = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "ok", "MID": message["MID"]}
             self.send(ok)
@@ -182,11 +186,36 @@ class Replica:
                     self.current_term = msg["term"]
                     self.votes_received = 0
                     self.timeout = random.uniform(0.015, 0.03)
+                else:
+                    if msg["term"] != self.current_term:
+                        # fail
+                        pass
+                    if msg["prevLogIndex"] >= len(self.entries):
+                        # fail bc entries doesn't have last log
+                        pass
+                    if self.entries[msg["prevLogIndex"]][0] != msg["prevLogTerm"]:
+                        # fail bc the terms of the last log don't match
+                        # delete all entries after
+                        pass
+                    msg_entries = msg["entries"]
+                    for i in range(msg["prevLogIndex"] + 1, len(msg_entries)):
+                        self.entries.append(msg_entries[i])
+
+                if msg["leaderCommit"] > self.commit_index:
+                    # commit stuff from self.commit_index to leaderCommit
+                    for i in range(self.commit_index + 1, msg["leaderCommit"] + 1):
+                        entry = self.entries[i]
+                        self.database[entry[1]] = entry[2]
+                    self.commit_index = msg["leaderCommit"]
+                    
             elif msg_type == "ok":
                 self.ok_received += 1
                 if (len(self.others) + 1) / 2 < self.ok_received:
-                    hi = 1
                     # commit message
+                    entry = self.entries[self.commit_index + 1]
+                    self.database[entry[1]] = entry[2]
+                    self.commit_index += 1
+                    self.ok_received = 0
 
 
 
