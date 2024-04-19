@@ -21,7 +21,8 @@ class Replica:
         self.prev_log_index = 0
         self.prev_log_term = 0
         self.entries = []
-        self.leader_commit_index = 0
+        self.commit_index = 0
+        self.ok_received = 0
 
 
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -60,9 +61,18 @@ class Replica:
             key = message["key"]
             value = message["value"]
             self.database[key] = value
+            
             if self.state == "leader":
-                ok = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "ok", "MID": message["MID"]}
-                self.send(ok)
+                entry = [self.current_term, key, value]
+                self.entries.append(entry)
+                append_entries = {"src": self.id, "dst": BROADCAST, "leader": self.id, "type": "AppendEntries", 
+                "MID": self.generate_mid(), "term": self.current_term, "prevLogIndex": self.prev_log_index, 
+                "prevLogTerm": self.prev_log_term, "entries": self.entries, "leaderCommit": self.commit_index}
+                self.send(append_entries)
+                self.ok_received = 1
+
+            ok = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "ok", "MID": message["MID"]}
+            self.send(ok)
         except Exception as e:
             print("incorrect format of put message")
             print(e)
@@ -115,7 +125,7 @@ class Replica:
         if self.timeout_expired():
             append_entries = {"src": self.id, "dst": BROADCAST, "leader": self.id, "type": "AppendEntries", 
             "MID": self.generate_mid(), "term": self.current_term, "prevLogIndex": self.prev_log_index, 
-            "prevLogTerm": self.prev_log_term, "entries": [], "leaderCommit": self.leader_commit_index}
+            "prevLogTerm": self.prev_log_term, "entries": [], "leaderCommit": self.commit_index}
             self.send(append_entries)
             self.last_leader_msg = time.time()
 
@@ -155,7 +165,7 @@ class Replica:
                         # broadcast AppendEntries message
                         append_entries = {"src": self.id, "dst": BROADCAST, "leader": self.id, "type": "AppendEntries", 
                         "MID": self.generate_mid(), "term": self.current_term, "prevLogIndex": self.prev_log_index, 
-                        "prevLogTerm": self.prev_log_term, "entries": [], "leaderCommit": self.leader_commit_index}
+                        "prevLogTerm": self.prev_log_term, "entries": [], "leaderCommit": self.commit_index}
                         self.send(append_entries)
                         self.leader = self.id
                         self.voted = False
@@ -172,6 +182,11 @@ class Replica:
                     self.current_term = msg["term"]
                     self.votes_received = 0
                     self.timeout = random.uniform(0.015, 0.03)
+            elif msg_type == "ok":
+                self.ok_received += 1
+                if (len(self.others) + 1) / 2 < self.ok_received:
+                    hi = 1
+                    # commit message
 
 
 
