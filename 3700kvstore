@@ -23,6 +23,11 @@ class Replica:
         self.entries = []
         self.commit_index = -1
         self.ok_received = 0
+        self.match_index = {}
+        self.all_keys = set()
+
+        for replica_id in self.others:
+            self.match_index[replica_id] = -1
 
 
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -60,9 +65,10 @@ class Replica:
                 '''
                 key = message["key"]
                 value = message["value"]
+                self.all_keys.add(key)
                 #self.database[key] = value
                 
-                entry = [self.current_term, key, value]
+                entry = [self.current_term, key, value, message["MID"], message["src"]]
                 self.entries.append(entry)
                 append_entries = {"src": self.id, "dst": BROADCAST, "leader": self.id, "type": "AppendEntries", 
                 "MID": self.generate_mid(), "term": self.current_term, "prevLogIndex": self.prev_log_index, 
@@ -75,8 +81,8 @@ class Replica:
                 self.prev_log_index = len(self.entries) - 1
                 self.prev_log_term = self.current_term
             
-                ok = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "ok", "MID": message["MID"]}
-                self.send(ok)
+                #ok = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "ok", "MID": message["MID"]}
+                #self.send(ok)
         except Exception as e:
             print("incorrect format of put message")
             print(e)
@@ -99,11 +105,19 @@ class Replica:
                 '''
 
                 key = message["key"]
-                value = self.database.get(key)
-                if value is None:
-                    value = ""
-                ok = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "ok", "MID": message["MID"], "value": value}
-                self.send(ok)
+                value = self.database.get(key, "")
+                fail = False
+                for i in range(self.commit_index + 1, len(self.entries)):
+                    if self.entries[i][1] == key:
+                        fail = True
+                        break
+
+                if fail:
+                    fail = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "fail", "MID": message["MID"]}
+                    self.send(fail)
+                else:
+                    ok = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "ok", "MID": message["MID"], "value": value}
+                    self.send(ok)
         except Exception as e:
             print("incorrect format of get message")
             print(e)
@@ -115,7 +129,7 @@ class Replica:
 
     def follower_behavior(self):
         # follower behavior
-        print("---- in follower behavior")
+        # print("---- in follower behavior")
         if self.timeout_expired():
             print("---- %s beginning election" % (self.id))
             self.state = 'candidate'
@@ -133,6 +147,22 @@ class Replica:
             "prevLogTerm": self.prev_log_term, "entries": [], "leaderCommit": self.commit_index}
             self.send(append_entries)
             self.last_leader_msg = time.time()
+
+    def can_commit(self):
+        count = 0
+        min_commit = None
+        for replica, match in self.match_index.items():
+            if match > self.commit_index:
+                count += 1
+                if min_commit is None:
+                    min_commit = match
+                else:
+                    min_commit = min(min_commit, match)
+        if ((len(self.others) + 1) / 2) + 1 < count:
+            return True, min_commit
+        else:
+            return False, min_commit
+        
 
     def run(self):
         while True:
@@ -184,7 +214,7 @@ class Replica:
                     for i in range(self.commit_index + 1, msg["leaderCommit"] + 1):
                         entry = self.entries[i]
                         self.database[entry[1]] = entry[2]
-                    self.commit_index = min(msg["leaderCommit"], len(self.log) - 1)
+                    self.commit_index = min(msg["leaderCommit"], len(self.entries) - 1)
 
                 msg_entries = msg["entries"]
                 if self.leader != msg["leader"] and self.current_term <= msg["term"]:
@@ -197,15 +227,8 @@ class Replica:
                 elif len(msg_entries) > 0:
                     print("____________ REPLICA RECEIVES APPEND ENTRIES ____________'%s'" % (msg,), flush=True)
                     msg_prev_index = msg["prevLogIndex"]
-                    self.entries = self.entries[0:msg_prev_index + 1]
-                    for i in range(msg_prev_index + 1, len(msg_entries)):
-                        self.entries.append(msg_entries[i])
-                    response = {"src": self.id, "dst": msg["src"], "leader": self.leader, "type": "AppendSuccess", 
-                    "MID": msg["MID"], "term": self.current_term, "lastEntryIndex": len(self.entries)}
-                    self.send(response)
-                    print("____________ REPLICA SENDS APPEND SUCCESS _______________")
                     
-                    if msg["term"] < self.current_term:
+                    if msg["term"] != -1 and msg["term"] < self.current_term:
                         print("____________ HERE 1 _______________")
                         #response = {"src": self.id, "dst": msg["src"], "leader": self.leader, "type": "AppendFail", 
                         #"MID": msg["MID"], "term": self.current_term, "failAt": msg_prev_index + 1}
@@ -215,8 +238,13 @@ class Replica:
 
                     if msg_prev_index >= len(self.entries):
                         print("____________ HERE 2 _______________")
-                        response = {"src": self.id, "dst": msg["src"], "leader": self.leader, "type": "AppendFail", 
-                        "MID": msg["MID"], "term": self.current_term, "failAt": len(self.entries)}
+                        #response = {"src": self.id, "dst": msg["src"], "leader": self.leader, "type": "AppendFail", 
+                        #"MID": msg["MID"], "term": self.current_term, "failAt": len(self.entries)}
+                        #self.send(response)
+                        for i in range(len(self.entries), len(msg_entries)):
+                            self.entries.append(msg_entries[i])
+                        response = {"src": self.id, "dst": msg["src"], "leader": self.leader, "type": "AppendSuccess", 
+                        "MID": msg["MID"], "term": self.current_term, "matchIndex": len(self.entries) - 1}
                         self.send(response)
                     elif msg_prev_index > -1 and self.entries[msg_prev_index][0] != msg["prevLogTerm"]:
                         print("____________ HERE 3 _______________")
@@ -231,20 +259,27 @@ class Replica:
                         for i in range(msg_prev_index + 1, len(msg_entries)):
                             self.entries.append(msg_entries[i])
                         response = {"src": self.id, "dst": msg["src"], "leader": self.leader, "type": "AppendSuccess", 
-                        "MID": msg["MID"], "term": self.current_term, "matchIndex": len(self.entries)}
+                        "MID": msg["MID"], "term": self.current_term, "matchIndex": len(self.entries) - 1}
                         self.send(response)
                         print("____________ REPLICA SENDS APPEND SUCCESS _______________")
+                        self.prev_log_index = msg_prev_index
+                        self.prev_log_term = msg["prevLogTerm"]
                     
                     
             elif msg_type == "AppendSuccess":
                 print("_________________ RECEIVE APPEND SUCCESS ______________________")
                 self.ok_received += 1
-                if (len(self.others) + 1) / 2 < self.ok_received:
+                self.match_index[msg["src"]] = msg["matchIndex"]
+                is_majority, min_commit = self.can_commit()
+                if is_majority:
                     # commit message
-                    print("_________________ VALUE COMMITTED ______________________")
-                    entry = self.entries[self.commit_index + 1]
-                    self.database[entry[1]] = entry[2]
-                    self.commit_index += 1
+                    print("_________________ VALUE COMMITTED _________UP UNTIL " + str(min_commit))
+                    for i in range(self.commit_index + 1, min_commit + 1):
+                        entry = self.entries[i]
+                        self.database[entry[1]] = entry[2]
+                        ok = {"src": self.id, "dst": entry[4], "leader": self.leader, "type": "ok", "MID": entry[3]}
+                        self.send(ok)
+                    self.commit_index = min_commit
                     self.ok_received = 0
 
 
