@@ -14,9 +14,9 @@ class Replica:
         self.leader = "FFFF"
         self.state = "follower"
         self.current_term = 0
-        self.voted = False
+        self.votedFor = None
         self.votes_received = 0
-        self.timeout = random.uniform(0.015, 0.03)
+        self.timeout = random.uniform(0.15, 0.3)
         self.last_leader_msg = time.time()
         self.prev_log_index = -1
         self.prev_log_term = -1
@@ -129,7 +129,6 @@ class Replica:
 
     def follower_behavior(self):
         # follower behavior
-        # print("---- in follower behavior")
         if self.timeout_expired():
             print("---- %s beginning election" % (self.id))
             self.state = 'candidate'
@@ -138,7 +137,8 @@ class Replica:
             # send request_vote messages to everyone
             request_vote = {"src": self.id, "dst": BROADCAST, "leader": self.id, "type": "RequestVote", "MID": self.generate_mid()}
             self.send(request_vote)
-            self.voted = True
+            self.votedFor = self.id
+            self.last_leader_msg = time.time()
 
     def leader_behavior(self):
         if self.timeout_expired():
@@ -170,7 +170,9 @@ class Replica:
             #print(self.state + " with num votes: " + str(self.votes_received))
             if self.state == 'leader':
                 self.leader_behavior()
-            if self.state != 'leader' and not self.voted:
+            if self.state == 'follower' and self.votedFor is None:
+                self.follower_behavior()
+            if self.state == 'candidate':
                 self.follower_behavior()
 
             data, addr = self.socket.recvfrom(65535)
@@ -186,11 +188,11 @@ class Replica:
             elif msg_type == "get":
                 self.handle_get(msg)
             elif msg_type == "RequestVote":
-                if not self.voted: # self.state != "leader" and not self.voted:
+                if self.state != "leader" and (self.votedFor is None or self.votedFor == msg["src"]):
                     print("---- %s votes for %s as leader" % (self.id, msg["leader"]))
                     vote = {"src": self.id, "dst": msg["src"], "leader": msg["leader"], "type": "Vote", "MID": msg["MID"]}
                     self.send(vote)
-                    self.voted = True
+                    self.votedFor = msg["src"]
             elif msg_type == "Vote":
                 if self.state == "candidate":
                     self.votes_received += 1
@@ -203,12 +205,12 @@ class Replica:
                         "prevLogTerm": self.prev_log_term, "entries": [], "leaderCommit": self.commit_index}
                         self.send(append_entries)
                         self.leader = self.id
-                        self.voted = False
+                        self.votedFor = None
                         self.votes_received = 0
                         self.last_leader_msg = time.time()
-                        self.timeout = 0.01
+                        self.timeout = 0.14
             elif msg_type == "AppendEntries":
-                self.voted = False
+                self.votedFor = None
                 if self.leader == msg["leader"] and msg["leaderCommit"] > self.commit_index:
                     # commit stuff from self.commit_index to leaderCommit
                     for i in range(self.commit_index + 1, msg["leaderCommit"] + 1):
@@ -223,7 +225,7 @@ class Replica:
                     self.leader = msg["leader"]
                     self.current_term = msg["term"]
                     self.votes_received = 0
-                    self.timeout = random.uniform(0.015, 0.03)
+                    self.timeout = random.uniform(0.15, 0.3)
                 elif len(msg_entries) > 0:
                     print("____________ REPLICA RECEIVES APPEND ENTRIES ____________'%s'" % (msg,), flush=True)
                     msg_prev_index = msg["prevLogIndex"]
@@ -264,8 +266,6 @@ class Replica:
                         print("____________ REPLICA SENDS APPEND SUCCESS _______________")
                         self.prev_log_index = msg_prev_index
                         self.prev_log_term = msg["prevLogTerm"]
-                    
-                    
             elif msg_type == "AppendSuccess":
                 print("_________________ RECEIVE APPEND SUCCESS ______________________")
                 self.ok_received += 1
