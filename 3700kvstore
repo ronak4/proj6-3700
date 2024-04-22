@@ -4,7 +4,7 @@ import argparse, socket, time, json, select, struct, sys, math, os, random, stri
 
 BROADCAST = "FFFF"
 
-
+# A replicated key-value datastore that follows the RAFT protocol
 class Replica:
     def __init__(self, port, id, others):
         self.port = port
@@ -13,144 +13,132 @@ class Replica:
         self.database = {}
         self.leader = "FFFF"
         self.state = "follower"
+
         self.current_term = 0
         self.votedFor = None
+        self.entries = []
+
         self.votes_received = 0
         self.timeout = random.uniform(0.15, 0.3)
         self.last_leader_msg = time.time()
-        self.prev_log_index = -1
-        self.prev_log_term = -1
-        self.entries = []
+        
+        # highest log entry committed
         self.commit_index = -1
-        self.ok_received = 0
-        self.match_index = {}
-        self.all_keys = set()
-
-        for replica_id in self.others:
-            self.match_index[replica_id] = -1
-
+        # for each server, index of the next log entry to send to that server
+        self.next_index = {}
+        # for each server, index of highest log entry, known to be replicated on server
+        self.match_index  = {}
 
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind(('localhost', 0))
 
-        print("Replica %s starting up" % self.id, flush=True)
+        #print("Replica %s starting up" % self.id, flush=True)
         hello = {"src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello"}
         self.send(hello)
-        print("Sent hello message: %s" % hello, flush=True)
+        #print("Sent hello message: %s" % hello, flush=True)
 
+    # Sends the json message to the intended source
     def send(self, message):
-        self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
-    
-    def generate_mid(self):
-        characters = string.ascii_uppercase + string.digits  
-        random_string = ''.join(random.choice(characters) for _ in range(16))
-        return random_string
+        try:
+            self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
+        except Exception as e:
+            print(e)
+            print(len(self.entries))
+            print(json.dumps(message)[0:123])
 
+    # Send a redirect message back to the source if the replica is not the leader
     def redirect(self, message):
         redirect = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "redirect", "MID": message["MID"]}
         self.send(redirect)
 
+    # Handles receiving put requests from the client. If the replica is not the leader, then sends a 
+    # redirect message. Otherwise, replicates the command to the other replicas. 
     def handle_put(self, message):
         try:
             if self.state != "leader" and message["src"] != self.leader:
                 self.redirect(message)
-                return
             elif self.state == "leader":
-                '''
-                replica_msg = {"src": self.id, "dst": BROADCAST, "leader": self.leader, "type": "put", 
-                "MID": message["MID"], "key": message["key"], "value": message["value"]}
-                for id in self.others:
-                    replica_msg["dst"] = id
-                    self.send(replica_msg)
-                '''
-                key = message["key"]
-                value = message["value"]
-                self.all_keys.add(key)
-                #self.database[key] = value
-                
-                entry = [self.current_term, key, value, message["MID"], message["src"]]
+                entry = [self.current_term, message["key"], message["value"], message["MID"], message["src"]]
                 self.entries.append(entry)
-                append_entries = {"src": self.id, "dst": BROADCAST, "leader": self.id, "type": "AppendEntries", 
-                "MID": self.generate_mid(), "term": self.current_term, "prevLogIndex": self.prev_log_index, 
-                "prevLogTerm": self.prev_log_term, "entries": self.entries, "leaderCommit": self.commit_index}
-                self.send(append_entries)
-                print("____________ LEADER SENDS APPEND ENTRIES _______________")
-                
-                self.last_leader_msg = time.time()
-                self.ok_received = 1
-                self.prev_log_index = len(self.entries) - 1
-                self.prev_log_term = self.current_term
-            
-                #ok = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "ok", "MID": message["MID"]}
-                #self.send(ok)
+                last_log_index = len(self.entries) - 1
+
+                for replica_id, next_index in self.next_index.items():
+                    if last_log_index >= next_index:
+                        prev_log_index = next_index - 1
+                        prev_log_term = self.get_prev_log_term(prev_log_index)
+                        last_index = min(len(self.entries), prev_log_index + 1 + 85)
+                        append_entries = {"src": self.id, "dst": replica_id, "leader": self.id, "type": "AppendEntries", 
+                        "term": self.current_term, "prevLogIndex": prev_log_index, "prevLogTerm": prev_log_term, 
+                        "entries": self.entries[prev_log_index + 1:last_index], "leaderCommit": self.commit_index}
+                        self.send(append_entries)
+                        self.last_leader_msg = time.time()
         except Exception as e:
             print("incorrect format of put message")
             print(e)
             fail = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "fail", "MID": message["MID"]}
             self.send(fail)
 
+    # Handles receiving get requests from the client. If the replica is not the leader, then sends a 
+    # redirect message. Otherwise, gets the requested value and sends it back to the client. 
     def handle_get(self, message):
         try:
             if self.state != "leader" and message["src"] != self.leader:
                 self.redirect(message)
-                return
             elif self.state == "leader":
-                '''
-                replica_msg = {"src": self.id, "dst": BROADCAST, "leader": self.leader, "type": "get", 
-                "MID": message["MID"], "key": message["key"]}
-                for id in self.others:
-                    replica_msg["dst"] = id
-                    self.send(replica_msg)
-                self.last_leader_msg = time.time()
-                '''
-
                 key = message["key"]
                 value = self.database.get(key, "")
-                fail = False
-                for i in range(self.commit_index + 1, len(self.entries)):
-                    if self.entries[i][1] == key:
-                        fail = True
-                        break
-
-                if fail:
-                    fail = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "fail", "MID": message["MID"]}
-                    self.send(fail)
-                else:
-                    ok = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "ok", "MID": message["MID"], "value": value}
-                    self.send(ok)
+                ok = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "ok", "MID": message["MID"], "value": value}
+                self.send(ok)
         except Exception as e:
             print("incorrect format of get message")
             print(e)
             fail = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "fail", "MID": message["MID"]}
             self.send(fail)
     
+    # Checks if an election timeout has occured based on the last time the leader 
+    # sent a message
     def timeout_expired(self):
         return time.time() - self.last_leader_msg > self.timeout
 
-    def follower_behavior(self):
-        # follower behavior
+    # Retrieves the term number of the entry at the given index
+    def get_prev_log_term(self, last_log_index):
+        last_log_term = 0
+        if last_log_index >= 0:
+            last_log_term = self.entries[last_log_index][0]
+        return last_log_term
+
+    # Starts an election if an election timeout has occurred
+    def start_election(self):
         if self.timeout_expired():
-            print("---- %s beginning election" % (self.id))
+            #print("---- %s beginning election" % (self.id))
             self.state = 'candidate'
             self.current_term += 1
             self.votes_received = 1
             # send request_vote messages to everyone
-            request_vote = {"src": self.id, "dst": BROADCAST, "leader": self.id, "type": "RequestVote", "MID": self.generate_mid()}
+            last_log_index = len(self.entries) - 1
+            last_log_term = self.get_prev_log_term(last_log_index)
+            request_vote = {"src": self.id, "dst": BROADCAST, "leader": self.id, "type": "RequestVote", 
+            "term": self.current_term, "lastLogIndex": last_log_index, "lastLogTerm": last_log_term}
             self.send(request_vote)
             self.votedFor = self.id
             self.last_leader_msg = time.time()
 
-    def leader_behavior(self):
-        if self.timeout_expired():
-            append_entries = {"src": self.id, "dst": BROADCAST, "leader": self.id, "type": "AppendEntries", 
-            "MID": self.generate_mid(), "term": self.current_term, "prevLogIndex": self.prev_log_index, 
-            "prevLogTerm": self.prev_log_term, "entries": [], "leaderCommit": self.commit_index}
-            self.send(append_entries)
-            self.last_leader_msg = time.time()
+    # Sends a empty AppendEntries RPC to the other replicas if it has been too 
+    # long since the leader has sent a message
+    def send_heartbeat(self):
+        prev_log_index = len(self.entries) - 1
+        prev_log_term = self.get_prev_log_term(prev_log_index)
+        append_entries = {"src": self.id, "dst": BROADCAST, "leader": self.id, "type": "AppendEntries", 
+        "term": self.current_term, "prevLogIndex": prev_log_index, "prevLogTerm": prev_log_term, 
+        "entries": [], "leaderCommit": self.commit_index}
+        self.send(append_entries)
+        self.last_leader_msg = time.time()
 
+    # Checks if more entires have been replicated by majority of the replicas and 
+    # can therefore be committed
     def can_commit(self):
-        count = 0
-        min_commit = None
+        count = 1
+        min_commit = len(self.entries) - 1
         for replica, match in self.match_index.items():
             if match > self.commit_index:
                 count += 1
@@ -158,26 +146,22 @@ class Replica:
                     min_commit = match
                 else:
                     min_commit = min(min_commit, match)
-        if ((len(self.others) + 1) / 2) + 1 < count:
+        if ((len(self.others) + 1) / 2) < count and self.entries[min_commit][0] == self.current_term:
             return True, min_commit
         else:
             return False, min_commit
-        
 
+    # Runs the distributed key-value database following the RAFT protocol
     def run(self):
         while True:
-            #print("uhhhhhhhhhhhhhhhhhhh")
-            #print(self.state + " with num votes: " + str(self.votes_received))
-            if self.state == 'leader':
-                self.leader_behavior()
-            if self.state == 'follower' and self.votedFor is None:
-                self.follower_behavior()
-            if self.state == 'candidate':
-                self.follower_behavior()
+            if self.state == 'leader' and self.timeout_expired():
+                self.send_heartbeat()
+            if self.state != 'leader':
+                self.start_election()
 
             data, addr = self.socket.recvfrom(65535)
             msg = json.loads(data.decode('utf-8'))
-            print("Received message '%s'" % (msg,), flush=True)
+            #print("Received message '%s'" % (msg,), flush=True)
 
             if self.state != "leader" and msg["src"] == self.leader:
                 self.last_leader_msg = time.time()
@@ -189,99 +173,116 @@ class Replica:
                 self.handle_get(msg)
             elif msg_type == "RequestVote":
                 if self.state != "leader" and (self.votedFor is None or self.votedFor == msg["src"]):
-                    print("---- %s votes for %s as leader" % (self.id, msg["leader"]))
-                    vote = {"src": self.id, "dst": msg["src"], "leader": msg["leader"], "type": "Vote", "MID": msg["MID"]}
+                    #print("---- %s votes for %s as leader" % (self.id, msg["leader"]))
+                    last_index = len(self.entries) - 1
+                    last_term = self.get_prev_log_term(last_index)
+                    vote = {"src": self.id, "dst": msg["src"], "leader": msg["leader"], "type": "Vote", 
+                    "term": msg["term"], "voteGranted": True}
+                    if self.current_term > msg["term"]:
+                        print("term numbers of replica is greater %d > %d" % (self.current_term, msg["term"]))
+                        vote["term"] = self.current_term
+                        vote["voteGranted"] = False
+                    if last_term > msg["lastLogTerm"] or (last_term == msg["lastLogTerm"] and last_index > msg["lastLogIndex"]):
+                        print("term/index dont match %d, %d ... %d, %d" % (last_term, last_index, msg["lastLogTerm"], msg["lastLogIndex"]))
+                        vote["voteGranted"] = False
                     self.send(vote)
                     self.votedFor = msg["src"]
+                    self.last_leader_msg_time = time.time()
             elif msg_type == "Vote":
                 if self.state == "candidate":
-                    self.votes_received += 1
+                    if msg["voteGranted"]:
+                        self.votes_received += 1
+                    else:
+                        if msg["term"] > self.current_term:
+                            self.state = "follower"
+                            self.votedFor = None
+                            self.votes_received = 0
                     if (len(self.others) + 1) / 2 < self.votes_received:
-                        print("---- %s IS THE NEW LEADER" % (self.id))
+                        #print("---- %s IS THE NEW LEADER" % (self.id))
                         self.state = "leader"
                         # broadcast AppendEntries message
-                        append_entries = {"src": self.id, "dst": BROADCAST, "leader": self.id, "type": "AppendEntries", 
-                        "MID": self.generate_mid(), "term": self.current_term, "prevLogIndex": self.prev_log_index, 
-                        "prevLogTerm": self.prev_log_term, "entries": [], "leaderCommit": self.commit_index}
-                        self.send(append_entries)
+                        self.send_heartbeat()
                         self.leader = self.id
                         self.votedFor = None
                         self.votes_received = 0
-                        self.last_leader_msg = time.time()
                         self.timeout = 0.14
+                        self.next_index.clear()
+                        self.match_index.clear()
+                        last_log_index = len(self.entries) - 1
+                        for replica in self.others:
+                            self.next_index[replica] = last_log_index + 1
+                            self.match_index[replica] = 0
             elif msg_type == "AppendEntries":
+                self.last_leader_msg = time.time()
                 self.votedFor = None
-                if self.leader == msg["leader"] and msg["leaderCommit"] > self.commit_index:
-                    # commit stuff from self.commit_index to leaderCommit
-                    for i in range(self.commit_index + 1, msg["leaderCommit"] + 1):
-                        entry = self.entries[i]
-                        self.database[entry[1]] = entry[2]
-                    self.commit_index = min(msg["leaderCommit"], len(self.entries) - 1)
-
-                msg_entries = msg["entries"]
+                leader_entries = msg["entries"]
                 if self.leader != msg["leader"] and self.current_term <= msg["term"]:
-                    print("---- %s notified that %s is the new leader" % (self.id, msg["leader"]))
+                    #print("---- %s notified that %s is the new leader" % (self.id, msg["leader"]))
                     self.state = "follower"
                     self.leader = msg["leader"]
                     self.current_term = msg["term"]
                     self.votes_received = 0
                     self.timeout = random.uniform(0.15, 0.3)
-                elif len(msg_entries) > 0:
-                    print("____________ REPLICA RECEIVES APPEND ENTRIES ____________'%s'" % (msg,), flush=True)
-                    msg_prev_index = msg["prevLogIndex"]
-                    
-                    if msg["term"] != -1 and msg["term"] < self.current_term:
-                        print("____________ HERE 1 _______________")
-                        #response = {"src": self.id, "dst": msg["src"], "leader": self.leader, "type": "AppendFail", 
-                        #"MID": msg["MID"], "term": self.current_term, "failAt": msg_prev_index + 1}
-                        #self.send(response)
+                elif self.leader == msg["leader"] and len(leader_entries) > 0:
+                    prev_index = msg["prevLogIndex"]
+                    if self.current_term > msg["term"]:
+                        # respond false
+                        append_response = {"src": self.id, "dst": msg["src"], "leader": self.leader, "type": "AppendResponse", 
+                        "term": self.current_term, "success": False, "matchIndex": 0}
+                        self.send(append_response)
+                    elif prev_index >= len(self.entries):
+                        append_response = {"src": self.id, "dst": msg["src"], "leader": self.leader, "type": "AppendResponse", 
+                        "term": self.current_term, "success": False, "matchIndex": 0}
+                        self.send(append_response)
+                    elif prev_index >= 0 and self.entries[prev_index][0] != msg["prevLogTerm"]:
+                        self.entries = self.entries[0:prev_index]
+                        append_response = {"src": self.id, "dst": msg["src"], "leader": self.leader, "type": "AppendResponse", 
+                        "term": self.current_term, "success": False, "matchIndex": 0}
+                        self.send(append_response)
                     else:
-                        self.current_term = msg["term"]
-
-                    if msg_prev_index >= len(self.entries):
-                        print("____________ HERE 2 _______________")
-                        #response = {"src": self.id, "dst": msg["src"], "leader": self.leader, "type": "AppendFail", 
-                        #"MID": msg["MID"], "term": self.current_term, "failAt": len(self.entries)}
-                        #self.send(response)
-                        for i in range(len(self.entries), len(msg_entries)):
-                            self.entries.append(msg_entries[i])
-                        response = {"src": self.id, "dst": msg["src"], "leader": self.leader, "type": "AppendSuccess", 
-                        "MID": msg["MID"], "term": self.current_term, "matchIndex": len(self.entries) - 1}
-                        self.send(response)
-                    elif msg_prev_index > -1 and self.entries[msg_prev_index][0] != msg["prevLogTerm"]:
-                        print("____________ HERE 3 _______________")
-                        # fail bc the terms of the last log don't match
-                        # delete all entries after
-                        response = {"src": self.id, "dst": msg["src"], "leader": self.leader, "type": "AppendFail", 
-                        "MID": msg["MID"], "term": self.current_term, "failAt": msg_prev_index}
-                        self.send(response)
-                        self.entries = self.entries[0:msg_prev_index]
-                    else:
-                        self.entries = self.entries[0:msg_prev_index + 1]
-                        for i in range(msg_prev_index + 1, len(msg_entries)):
-                            self.entries.append(msg_entries[i])
-                        response = {"src": self.id, "dst": msg["src"], "leader": self.leader, "type": "AppendSuccess", 
-                        "MID": msg["MID"], "term": self.current_term, "matchIndex": len(self.entries) - 1}
-                        self.send(response)
-                        print("____________ REPLICA SENDS APPEND SUCCESS _______________")
-                        self.prev_log_index = msg_prev_index
-                        self.prev_log_term = msg["prevLogTerm"]
-            elif msg_type == "AppendSuccess":
-                print("_________________ RECEIVE APPEND SUCCESS ______________________")
-                self.ok_received += 1
-                self.match_index[msg["src"]] = msg["matchIndex"]
-                is_majority, min_commit = self.can_commit()
-                if is_majority:
-                    # commit message
-                    print("_________________ VALUE COMMITTED _________UP UNTIL " + str(min_commit))
-                    for i in range(self.commit_index + 1, min_commit + 1):
+                        self.entries = self.entries[0:prev_index]
+                        for entry in leader_entries:
+                            self.entries.append(entry)
+                        append_response = {"src": self.id, "dst": msg["src"], "leader": self.leader, "type": "AppendResponse", 
+                        "term": self.current_term, "success": True, "matchIndex": len(self.entries) - 1}
+                        self.send(append_response)
+                
+                if msg["leaderCommit"] > self.commit_index:
+                    new_commit_index = min(msg["leaderCommit"], len(self.entries) - 1)
+                    for i in range(self.commit_index + 1, new_commit_index + 1):
                         entry = self.entries[i]
                         self.database[entry[1]] = entry[2]
-                        ok = {"src": self.id, "dst": entry[4], "leader": self.leader, "type": "ok", "MID": entry[3]}
-                        self.send(ok)
-                    self.commit_index = min_commit
-                    self.ok_received = 0
-
+                    self.commit_index = new_commit_index
+            elif msg_type == "AppendResponse":
+                if self.state == "leader":
+                    replica_id = msg["src"]
+                    if msg["success"]:
+                        self.next_index[replica_id] = msg["matchIndex"] + 1
+                        self.match_index[replica_id] = msg["matchIndex"]
+                    else:
+                        if msg["term"] > self.current_term:
+                            self.state = "follower"
+                            self.current_term = msg["term"]
+                        else:
+                            self.next_index[replica_id] = max(self.next_index[replica_id] - 1, 0)
+                            next_index = self.next_index[replica_id]
+                            prev_log_index = next_index - 1
+                            prev_log_term = self.get_prev_log_term(prev_log_index)
+                            append_entries = {"src": self.id, "dst": replica_id, "leader": self.id, "type": "AppendEntries", 
+                            "term": self.current_term, "prevLogIndex": prev_log_index, "prevLogTerm": prev_log_term, 
+                            "entries": self.entries[prev_log_index + 1:], "leaderCommit": self.commit_index}
+                            self.send(append_entries)
+                            self.last_leader_msg = time.time()
+                    
+                    if self.state == "leader":
+                        is_majority, min_commit = self.can_commit()
+                        if is_majority:
+                            for i in range(self.commit_index + 1, min_commit + 1):
+                                entry = self.entries[i]
+                                self.database[entry[1]] = entry[2]
+                                ok = {"src": self.id, "dst": entry[4], "leader": self.id, "type": "ok", "MID": entry[3]}
+                                self.send(ok)
+                            self.commit_index = min_commit
 
 
 if __name__ == "__main__":
